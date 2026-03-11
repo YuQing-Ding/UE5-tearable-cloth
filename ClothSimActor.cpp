@@ -1,5 +1,3 @@
-// Copyright YUQING DING. All Rights Reserved.
-
 #include "ClothSimActor.h"
 #include "Components/SceneComponent.h"
 #include "DrawDebugHelpers.h"
@@ -20,10 +18,20 @@ AClothSimActor::AClothSimActor()
     ClothMesh->SetGenerateOverlapEvents(false);
 }
 
+void AClothSimActor::OnConstruction(const FTransform& Transform)
+{
+    Super::OnConstruction(Transform);
+    RebuildCloth();
+}
+
 void AClothSimActor::BeginPlay()
 {
     Super::BeginPlay();
-    RebuildCloth();
+
+    if (Points.Num() <= 0 || Constraints.Num() <= 0 || !bMeshSectionCreated)
+    {
+        RebuildCloth();
+    }
 }
 
 void AClothSimActor::Tick(float DeltaTime)
@@ -40,6 +48,11 @@ void AClothSimActor::Tick(float DeltaTime)
         SimulateStep(FixedTimeStep);
         TimeAccumulator -= FixedTimeStep;
         ++Substeps;
+    }
+
+    if (Substeps > 0)
+    {
+        bRenderVerticesDirty = true;
     }
 
     UpdateRenderMesh();
@@ -95,11 +108,13 @@ void AClothSimActor::RebuildCloth()
 
     bTopologyDirty = true;
     bMeshSectionCreated = false;
+    bRenderVerticesDirty = true;
 
     ClothWidth = FMath::Max(1, ClothWidth);
     ClothHeight = FMath::Max(1, ClothHeight);
     Spacing = FMath::Max(1.0f, Spacing);
     SolverIterations = FMath::Max(1, SolverIterations);
+    CollisionPassesWhenTearing = FMath::Clamp(CollisionPassesWhenTearing, 1, 64);
     FixedTimeStep = FMath::Max(0.001f, FixedTimeStep);
     MaxSubsteps = FMath::Max(1, MaxSubsteps);
     Stiffness = FMath::Clamp(Stiffness, 0.01f, 1.0f);
@@ -107,6 +122,7 @@ void AClothSimActor::RebuildCloth()
     StretchCompliance = FMath::Max(0.0f, StretchCompliance);
     MaxStretchRatio = FMath::Max(1.0f, MaxStretchRatio);
     PointCollisionRadius = FMath::Max(0.1f, PointCollisionRadius);
+    MinWorldCollisionMoveDistance = FMath::Max(0.0f, MinWorldCollisionMoveDistance);
     TearDistance = FMath::Max(0.0f, TearDistance);
     DamageRadius = FMath::Max(1.0f, DamageRadius);
     UVTilingX = FMath::Max(0.001f, UVTilingX);
@@ -281,11 +297,41 @@ void AClothSimActor::SimulateStep(float Dt)
     Integrate(Dt);
     ResetConstraintLambdas();
 
+    const bool bEnableAnyCollision = bEnableWorldCollision || bUseLocalBoxCollider;
+    int32 CollisionPasses = 0;
+    if (bEnableAnyCollision)
+    {
+        CollisionPasses = bEnableTearing ? CollisionPassesWhenTearing : 1;
+        CollisionPasses = FMath::Clamp(CollisionPasses, 1, SolverIterations);
+    }
+
+    int32 CollisionPassesDone = 0;
+
     for (int32 Iter = 0; Iter < SolverIterations; ++Iter)
     {
         SolveConstraints(Dt);
+
+        if (CollisionPassesDone < CollisionPasses)
+        {
+            // evenly distribute collision passes, always including the last iteration
+            const int32 NextCollisionIter =
+                ((CollisionPassesDone + 1) * SolverIterations) / CollisionPasses - 1;
+
+            if (Iter >= NextCollisionIter)
+            {
+                SolveCollisions();
+                ++CollisionPassesDone;
+            }
+        }
+
         EnforceMaxStretch();
-        RePinPoints();
+    }
+
+    while (CollisionPassesDone < CollisionPasses)
+    {
+        SolveCollisions();
+        EnforceMaxStretch();
+        ++CollisionPassesDone;
     }
 
     // final safety pass
@@ -336,15 +382,59 @@ void AClothSimActor::SolveConstraints(float Dt)
     {
         SolveConstraintXPBD(C, Dt);
     }
+}
 
-    for (FClothPoint& P : Points)
+void AClothSimActor::SolveCollisions()
+{
+    if (Points.Num() <= 0)
     {
-        if (bEnableWorldCollision)
-        {
-            SolveWorldCollision(P);
-        }
+        return;
+    }
 
-        if (bUseLocalBoxCollider)
+    if (bEnableWorldCollision)
+    {
+        UWorld* World = GetWorld();
+        if (World)
+        {
+            const FTransform ActorXform = GetActorTransform();
+
+            FCollisionQueryParams Params(SCENE_QUERY_STAT(ClothPointSweep), false, this);
+            Params.bReturnPhysicalMaterial = false;
+
+            bool bRunPointSweeps = true;
+            if (bUseWorldCollisionBroadphase)
+            {
+                bRunPointSweeps = HasPotentialWorldCollision(World, ActorXform, Params);
+            }
+
+            if (bRunPointSweeps)
+            {
+                const FCollisionShape SweepShape = FCollisionShape::MakeSphere(PointCollisionRadius);
+                const float MinMoveDistanceSq =
+                    MinWorldCollisionMoveDistance * MinWorldCollisionMoveDistance;
+
+                for (FClothPoint& P : Points)
+                {
+                    if (P.bPinned)
+                    {
+                        continue;
+                    }
+
+                    if (MinMoveDistanceSq > 0.0f &&
+                        (P.Position - P.PrevPosition).SizeSquared() < MinMoveDistanceSq)
+                    {
+                        continue;
+                    }
+
+                    SolveWorldCollision(P, World, ActorXform, Params, SweepShape);
+                }
+            }
+        }
+    }
+
+    if (bUseLocalBoxCollider)
+    {
+        for (FClothPoint& P : Points)
         {
             SolveLocalBoxCollision(P);
         }
@@ -354,11 +444,6 @@ void AClothSimActor::SolveConstraints(float Dt)
 void AClothSimActor::SolveConstraintXPBD(FClothConstraint& Constraint, float Dt)
 {
     if (Constraint.bBroken)
-    {
-        return;
-    }
-
-    if (!Points.IsValidIndex(Constraint.P1) || !Points.IsValidIndex(Constraint.P2))
     {
         return;
     }
@@ -432,11 +517,6 @@ void AClothSimActor::EnforceMaxStretch()
             continue;
         }
 
-        if (!Points.IsValidIndex(C.P1) || !Points.IsValidIndex(C.P2))
-        {
-            continue;
-        }
-
         FClothPoint& P1 = Points[C.P1];
         FClothPoint& P2 = Points[C.P2];
 
@@ -481,30 +561,29 @@ void AClothSimActor::EnforceMaxStretch()
     }
 }
 
-void AClothSimActor::SolveWorldCollision(FClothPoint& Point)
+void AClothSimActor::SolveWorldCollision(
+    FClothPoint& Point,
+    UWorld* World,
+    const FTransform& ActorXform,
+    const FCollisionQueryParams& Params,
+    const FCollisionShape& SweepShape
+)
 {
     if (Point.bPinned)
     {
         return;
     }
 
-    UWorld* World = GetWorld();
     if (!World)
     {
         return;
     }
 
-    const FTransform ActorXform = GetActorTransform();
-
     const FVector StartWS = ActorXform.TransformPosition(Point.PrevPosition);
     const FVector EndWS = ActorXform.TransformPosition(Point.Position);
 
-    FCollisionQueryParams Params(SCENE_QUERY_STAT(ClothPointSweep), false, this);
-    Params.bReturnPhysicalMaterial = false;
-
     FHitResult Hit;
     const FQuat Rotation = FQuat::Identity;
-    const FCollisionShape Shape = FCollisionShape::MakeSphere(PointCollisionRadius);
 
     const bool bHit = World->SweepSingleByChannel(
         Hit,
@@ -512,7 +591,7 @@ void AClothSimActor::SolveWorldCollision(FClothPoint& Point)
         EndWS,
         Rotation,
         WorldCollisionChannel,
-        Shape,
+        SweepShape,
         Params
     );
 
@@ -534,6 +613,52 @@ void AClothSimActor::SolveWorldCollision(FClothPoint& Point)
     {
         DebugWorldHits.Add(Hit);
     }
+}
+
+bool AClothSimActor::HasPotentialWorldCollision(
+    UWorld* World,
+    const FTransform& ActorXform,
+    const FCollisionQueryParams& Params
+) const
+{
+    if (!World)
+    {
+        return false;
+    }
+
+    FBox ClothBounds(EForceInit::ForceInit);
+
+    for (const FClothPoint& P : Points)
+    {
+        if (P.bPinned)
+        {
+            continue;
+        }
+
+        ClothBounds += ActorXform.TransformPosition(P.PrevPosition);
+        ClothBounds += ActorXform.TransformPosition(P.Position);
+    }
+
+    if (!ClothBounds.IsValid)
+    {
+        return false;
+    }
+
+    const float Inflate = PointCollisionRadius + SurfaceOffset;
+    const FVector RawExtent = ClothBounds.GetExtent() + FVector(Inflate);
+    const FVector SafeExtent(
+        FMath::Max(RawExtent.X, 1.0f),
+        FMath::Max(RawExtent.Y, 1.0f),
+        FMath::Max(RawExtent.Z, 1.0f)
+    );
+
+    return World->OverlapBlockingTestByChannel(
+        ClothBounds.GetCenter(),
+        FQuat::Identity,
+        WorldCollisionChannel,
+        FCollisionShape::MakeBox(SafeExtent),
+        Params
+    );
 }
 
 void AClothSimActor::SolveLocalBoxCollision(FClothPoint& Point)
@@ -838,21 +963,30 @@ void AClothSimActor::UpdateRenderMesh()
         InitializeRenderBuffers();
         bTopologyDirty = true;
         bMeshSectionCreated = false;
-    }
-
-    for (int32 i = 0; i < VertexCount; ++i)
-    {
-        RenderVertices[i] = Points[i].Position;
+        bRenderVerticesDirty = true;
     }
 
     const bool bHadTopologyDirty = bTopologyDirty;
+    const bool bNeedGeometryUpdate =
+        bRenderVerticesDirty || bHadTopologyDirty || !bMeshSectionCreated;
+
+    if (bRenderVerticesDirty)
+    {
+        for (int32 i = 0; i < VertexCount; ++i)
+        {
+            RenderVertices[i] = Points[i].Position;
+        }
+    }
 
     if (bTopologyDirty)
     {
         RebuildTriangleIndexBuffer();
     }
 
-    RecalculateNormalsAndTangents();
+    if (bNeedGeometryUpdate)
+    {
+        RecalculateNormalsAndTangents();
+    }
 
     if (!bMeshSectionCreated || bHadTopologyDirty)
     {
@@ -874,7 +1008,7 @@ void AClothSimActor::UpdateRenderMesh()
 
         bMeshSectionCreated = true;
     }
-    else
+    else if (bNeedGeometryUpdate)
     {
         ClothMesh->UpdateMeshSection_LinearColor(
             0,
@@ -886,15 +1020,24 @@ void AClothSimActor::UpdateRenderMesh()
         );
     }
 
-    if (ClothMaterial)
+    if (ClothMaterial && ClothMesh->GetMaterial(0) != ClothMaterial)
     {
         ClothMesh->SetMaterial(0, ClothMaterial);
     }
 
-    ClothMesh->SetVisibility(true);
-    ClothMesh->SetCollisionEnabled(
-        bCreateMeshCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision
-    );
+    if (!ClothMesh->IsVisible())
+    {
+        ClothMesh->SetVisibility(true);
+    }
+
+    const ECollisionEnabled::Type DesiredCollisionMode =
+        bCreateMeshCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision;
+    if (ClothMesh->GetCollisionEnabled() != DesiredCollisionMode)
+    {
+        ClothMesh->SetCollisionEnabled(DesiredCollisionMode);
+    }
+
+    bRenderVerticesDirty = false;
 }
 
 float AClothSimActor::DistancePointToSegment(const FVector& P, const FVector& A, const FVector& B) const
@@ -1000,6 +1143,19 @@ float AClothSimActor::DistanceSegmentToSegment(const FVector& A0, const FVector&
 
 void AClothSimActor::DebugDraw() const
 {
+    const bool bNeedWorldHitDraw = bDrawWorldHits && DebugWorldHits.Num() > 0;
+    const bool bNeedDebugDraw =
+        bDrawPoints ||
+        bDrawConstraints ||
+        bDrawBrokenConstraints ||
+        (bUseLocalBoxCollider && bDrawBox) ||
+        bNeedWorldHitDraw;
+
+    if (!bNeedDebugDraw)
+    {
+        return;
+    }
+
     UWorld* World = GetWorld();
     if (!World)
     {
@@ -1087,7 +1243,7 @@ void AClothSimActor::DebugDraw() const
         }
     }
 
-    if (bDrawWorldHits)
+    if (bNeedWorldHitDraw)
     {
         for (const FHitResult& Hit : DebugWorldHits)
         {

@@ -1,4 +1,3 @@
-// Copyright YUQING DING. All Rights Reserved.
 #pragma once
 
 #include "CoreMinimal.h"
@@ -8,6 +7,9 @@
 
 class UMaterialInterface;
 class UProceduralMeshComponent;
+class UWorld;
+struct FCollisionQueryParams;
+struct FCollisionShape;
 
 USTRUCT(BlueprintType)
 struct FClothPoint
@@ -53,7 +55,7 @@ struct FClothConstraint
 };
 
 UCLASS()
-class YOUR_PROJECT_API AClothSimActor : public AActor //Replace YOUR_PROJECT_API to your Project name+API (e.g. TEST_PHYSICS_API)
+class PHYSICS_SANDBOX_API AClothSimActor : public AActor
 {
     GENERATED_BODY()
 
@@ -61,6 +63,7 @@ public:
     AClothSimActor();
 
 protected:
+    virtual void OnConstruction(const FTransform& Transform) override;
     virtual void BeginPlay() override;
     virtual void Tick(float DeltaTime) override;
 
@@ -138,6 +141,16 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "World Collision")
     float SurfaceOffset = 0.5f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "World Collision")
+    bool bUseWorldCollisionBroadphase = false;
+
+    // how many world/local collision passes to run per substep when tearing is enabled
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "World Collision", meta = (ClampMin = "1", ClampMax = "64"))
+    int32 CollisionPassesWhenTearing = 3;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "World Collision", meta = (ClampMin = "0.0"))
+    float MinWorldCollisionMoveDistance = 0.0f;
 
     // ===== Optional local box collider =====
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Local Collider")
@@ -249,6 +262,7 @@ private:
 
     bool bTopologyDirty = true;
     bool bMeshSectionCreated = false;
+    bool bRenderVerticesDirty = true;
 
 private:
     int32 GetPointIndex(int32 X, int32 Y) const;
@@ -260,13 +274,25 @@ private:
     void SimulateStep(float Dt);
     void Integrate(float Dt);
     void SolveConstraints(float Dt);
+    void SolveCollisions();
     void SolveConstraintXPBD(FClothConstraint& Constraint, float Dt);
-    void SolveWorldCollision(FClothPoint& Point);
+    void SolveWorldCollision(
+        FClothPoint& Point,
+        UWorld* World,
+        const FTransform& ActorXform,
+        const FCollisionQueryParams& Params,
+        const FCollisionShape& SweepShape
+    );
     void SolveLocalBoxCollision(FClothPoint& Point);
     void RePinPoints();
     void ResetConstraintLambdas();
     void EnforceMaxStretch();
     void DebugDraw() const;
+    bool HasPotentialWorldCollision(
+        UWorld* World,
+        const FTransform& ActorXform,
+        const FCollisionQueryParams& Params
+    ) const;
 
     void UpdateRenderMesh();
     void HandleRuntimeParameterChanges();
